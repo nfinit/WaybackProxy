@@ -85,6 +85,26 @@ class LRUDict(collections.OrderedDict):
 		# remove ttl from values
 		return (v for v, _ in super().values())
 
+def get_mac_address(ip_address):
+	"""Get MAC address for an IP address from the ARP table.
+	Returns MAC address in lowercase colon-separated format, or the IP if not found."""
+	try:
+		# Try reading /proc/net/arp (Linux)
+		with open('/proc/net/arp', 'r') as f:
+			for line in f:
+				parts = line.split()
+				# Skip header and check if this is our IP with valid flag (0x2)
+				if len(parts) >= 4 and parts[0] == ip_address and parts[2] == '0x2':
+					mac = parts[3].lower()
+					# Validate MAC address format
+					if mac != '00:00:00:00:00:00':
+						return mac
+	except:
+		pass
+
+	# Fallback: return IP address if MAC lookup fails
+	return ip_address
+
 class SharedState:
 	"""Class for storing shared state across instances of Handler."""
 
@@ -99,12 +119,39 @@ class SharedState:
 		# Create internal LRU dictionary for date availability.
 		self.availability_cache = LRUDict(maxduration=86400, maxsize=1024)
 
+		# Per-client date preferences.
+		self.client_dates = {}
+		self.client_dates_lock = threading.Lock()
+
 		# Read domain whitelist file.
 		try:
 			with open('whitelist.txt', 'r') as f:
 				self.whitelist = f.read().splitlines()
 		except:
 			self.whitelist = []
+
+		# Load saved client dates from file.
+		self.load_client_dates()
+
+	def load_client_dates(self):
+		"""Load per-client dates from file."""
+		try:
+			with open('client_dates.json', 'r') as f:
+				data = json.load(f)
+				with self.client_dates_lock:
+					self.client_dates = data
+		except:
+			pass
+
+	def save_client_dates(self):
+		"""Save per-client dates to file."""
+		try:
+			with self.client_dates_lock:
+				data = self.client_dates.copy()
+			with open('client_dates.json', 'w') as f:
+				json.dump(data, f, indent=4)
+		except Exception as e:
+			_print('[!] Failed to save client dates:', e)
 
 shared_state = SharedState()
 
@@ -136,7 +183,15 @@ class Handler(socketserver.BaseRequestHandler):
 		# read out the headers
 		request_host = None
 		pac_host = '" + location.host + ":' + str(LISTEN_PORT) # may not actually work
-		effective_date = DATE
+
+		# Get client IP and MAC address for identification.
+		client_ip = self.client_address[0]
+		client_id = get_mac_address(client_ip)
+
+		# Determine effective date for this client (identified by MAC address).
+		with self.shared_state.client_dates_lock:
+			effective_date = self.shared_state.client_dates.get(client_id, DATE)
+
 		auth = None
 		while line.strip() != '':
 			line = f.readline()
@@ -204,12 +259,12 @@ class Handler(socketserver.BaseRequestHandler):
 				self.request.sendall(pac.encode('ascii', 'ignore'))
 				return
 			elif hostname in self.shared_state.whitelist:
-				_print('[>] [byp]', archived_url)
+				_print('[>]', '[' + client_id + ']', '[byp]', archived_url)
 			elif hostname == 'web.archive.org':
 				if path[:5] != '/web/':
 					# Launch settings if enabled.
 					if SETTINGS_PAGE:
-						return self.handle_settings(parsed.query)
+						return self.handle_settings(parsed.query, client_id)
 					else:
 						return self.send_error_page(http_version, 404, 'Not Found')
 				else:
@@ -217,17 +272,17 @@ class Handler(socketserver.BaseRequestHandler):
 					split = request_url.split('/')
 					effective_date = split[4]
 					archived_url = '/'.join(split[5:])
-					_print('[>] [QI]', archived_url)
+					_print('[>]', '[' + client_id + ']', '[QI]', archived_url)
 			elif GEOCITIES_FIX and hostname == 'www.geocities.com':
 				# Apply GEOCITIES_FIX and pass it through.
-				_print('[>]', archived_url)
+				_print('[>]', '[' + client_id + ']', archived_url)
 
 				split = archived_url.split('/')
 				hostname = split[2] = 'www.oocities.org'
 				request_url = '/'.join(split)
 			else:
 				# Get from the Wayback Machine.
-				_print('[>]', archived_url)
+				_print('[>]', '[' + client_id + ']', '[' + effective_date + ']', archived_url)
 
 				request_url = 'https://web.archive.org/web/{0}if_/{1}'.format(effective_date, archived_url)
 
@@ -295,7 +350,7 @@ class Handler(socketserver.BaseRequestHandler):
 							archived_dest = re.sub('''^([^/]*//[^/]+):80''', '\\1', archived_dest)
 
 							# Add destination to availability cache and redirect the client.
-							_print('[r]', archived_dest)
+							_print('[r]', '[' + client_id + ']', archived_dest)
 							self.shared_state.availability_cache[archived_dest] = 'http://web.archive.org/web/' + match.group(1) + archived_dest
 							return self.send_redirect_page(http_version, archived_dest, conn.status)
 
@@ -375,7 +430,7 @@ class Handler(socketserver.BaseRequestHandler):
 				self.drain_conn(conn)
 				conn.release_conn()
 				archived_url = '/'.join(request_url.split('/')[5:])
-				_print('[r] [QI]', archived_url)
+				_print('[r]', '[' + client_id + ']', '[QI]', archived_url)
 				return self.send_redirect_page(http_version, archived_url, 301)
 
 			# Check if the date is within tolerance.
@@ -415,7 +470,7 @@ class Handler(socketserver.BaseRequestHandler):
 						archived_url = '/'.join(request_url.split('/')[5:])
 
 						# Start fetching the URL.
-						_print('[f]', archived_url)
+						_print('[f]', '[' + client_id + ']', archived_url)
 						conn = self.shared_state.http.urlopen('GET', request_url, retries=retry, preload_content=False)
 
 						if conn.status != 200:
@@ -460,7 +515,7 @@ class Handler(socketserver.BaseRequestHandler):
 							redirect_code = 302
 
 						# Redirect client to the URL.
-						_print('[r]', archived_url)
+						_print('[r]', '[' + client_id + ']', archived_url)
 						return self.send_redirect_page(http_version, archived_url, redirect_code)
 
 				# Remove pre-toolbar scripts and CSS.
@@ -645,36 +700,106 @@ class Handler(socketserver.BaseRequestHandler):
 			new_url = self.sanitize_redirect(urllib.parse.unquote_plus(match.group(1)))
 
 			# Redirect client to the URL.
-			_print('[r] [g]', new_url)
+			client_id = get_mac_address(self.client_address[0])
+			_print('[r]', '[' + client_id + ']', '[g]', new_url)
 			self.send_redirect_page(http_version, new_url)
 			return True
 		return False
 
-	def handle_settings(self, query):
+	def handle_settings(self, query, client_id):
 		"""Generate the settings page."""
 
 		global DATE, DATE_TOLERANCE, GEOCITIES_FIX, QUICK_IMAGES, WAYBACK_API, CONTENT_TYPE_ENCODING, SILENT, SETTINGS_PAGE
+
+		# Get client IP for display purposes.
+		client_ip = self.client_address[0]
 
 		if query != '': # handle any parameters that may have been sent
 			parsed = urllib.parse.parse_qs(query)
 
 			if 'date' in parsed and 'dateTolerance' in parsed:
-				if DATE != parsed['date'][0]:
-					DATE = parsed['date'][0]
-					self.shared_state.date_cache.clear()
-					self.shared_state.availability_cache.clear()
+				new_date = parsed['date'][0]
+
+				# Check if this is a client-specific date or global default change.
+				if 'clientSpecific' in parsed:
+					# Set date for this specific client.
+					with self.shared_state.client_dates_lock:
+						old_date = self.shared_state.client_dates.get(client_id, DATE)
+						if old_date != new_date:
+							self.shared_state.client_dates[client_id] = new_date
+							self.shared_state.date_cache.clear()
+							self.shared_state.availability_cache.clear()
+					self.shared_state.save_client_dates()
+				else:
+					# Set global default date.
+					if DATE != new_date:
+						DATE = new_date
+						self.shared_state.date_cache.clear()
+						self.shared_state.availability_cache.clear()
+
 				if DATE_TOLERANCE != parsed['dateTolerance'][0]:
 					DATE_TOLERANCE = parsed['dateTolerance'][0]
 				GEOCITIES_FIX = 'gcFix' in parsed
 				QUICK_IMAGES = 'quickImages' in parsed
 				CONTENT_TYPE_ENCODING = 'ctEncoding' in parsed
 
+			# Handle client removal.
+			if 'removeClient' in parsed:
+				remove_id = parsed['removeClient'][0]
+				with self.shared_state.client_dates_lock:
+					if remove_id in self.shared_state.client_dates:
+						del self.shared_state.client_dates[remove_id]
+				self.shared_state.save_client_dates()
+
+		# Get current client's date.
+		with self.shared_state.client_dates_lock:
+			client_date = self.shared_state.client_dates.get(client_id, DATE)
+			all_clients = sorted(self.shared_state.client_dates.items())
+
 		# send the page and stop
 		settingspage  = 'HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n'
 		settingspage += '<html><head><title>WaybackProxy Settings</title></head><body><p><b>'
 		settingspage += self.signature()
-		settingspage += '</b></p><form method="get" action="/">'
-		settingspage += '<p>Date to get pages from: <input type="text" name="date" size="8" value="'
+		settingspage += '</b></p>'
+
+		# Client-specific settings.
+		settingspage += '<h3>Client Settings</h3>'
+		settingspage += '<p>Your IP: ' + client_ip + '<br>'
+		settingspage += 'Hardware Address (MAC): ' + client_id + '</p>'
+		settingspage += '<form method="get" action="/">'
+		settingspage += '<p>Date for this client: <input type="text" name="date" size="8" value="'
+		settingspage += str(client_date)
+		settingspage += '"><input type="hidden" name="clientSpecific" value="1">'
+		settingspage += '<input type="hidden" name="dateTolerance" value="' + str(DATE_TOLERANCE) + '">'
+		if GEOCITIES_FIX:
+			settingspage += '<input type="hidden" name="gcFix" value="1">'
+		if QUICK_IMAGES:
+			settingspage += '<input type="hidden" name="quickImages" value="1">'
+		if CONTENT_TYPE_ENCODING:
+			settingspage += '<input type="hidden" name="ctEncoding" value="1">'
+		settingspage += '<input type="submit" value="Save Client Date"></p></form>'
+
+		# Show all clients.
+		if all_clients:
+			settingspage += '<h3>All Connected Clients</h3><table border="1" cellpadding="5"><tr><th>Hardware Address (MAC)</th><th>Date</th><th>Action</th></tr>'
+			for hwaddr, date in all_clients:
+				settingspage += '<tr><td>' + hwaddr + '</td><td>' + date + '</td><td>'
+				settingspage += '<form method="get" action="/" style="margin:0;"><input type="hidden" name="removeClient" value="' + hwaddr + '">'
+				settingspage += '<input type="hidden" name="date" value="' + str(DATE) + '">'
+				settingspage += '<input type="hidden" name="dateTolerance" value="' + str(DATE_TOLERANCE) + '">'
+				if GEOCITIES_FIX:
+					settingspage += '<input type="hidden" name="gcFix" value="1">'
+				if QUICK_IMAGES:
+					settingspage += '<input type="hidden" name="quickImages" value="1">'
+				if CONTENT_TYPE_ENCODING:
+					settingspage += '<input type="hidden" name="ctEncoding" value="1">'
+				settingspage += '<input type="submit" value="Remove"></form></td></tr>'
+			settingspage += '</table>'
+
+		# Global settings.
+		settingspage += '<h3>Global Default Settings</h3>'
+		settingspage += '<form method="get" action="/">'
+		settingspage += '<p>Default date for new clients: <input type="text" name="date" size="8" value="'
 		settingspage += str(DATE)
 		settingspage += '"><p>Date tolerance: <input type="text" name="dateTolerance" size="8" value="'
 		settingspage += str(DATE_TOLERANCE)
@@ -687,7 +812,7 @@ class Handler(socketserver.BaseRequestHandler):
 		settingspage += '> Quick images<br><input type="checkbox" name="ctEncoding"'
 		if CONTENT_TYPE_ENCODING:
 			settingspage += ' checked'
-		settingspage += '> Encoding in Content-Type</p><p><input type="submit" value="Save"></p></form></body></html>'
+		settingspage += '> Encoding in Content-Type</p><p><input type="submit" value="Save Global Settings"></p></form></body></html>'
 		self.request.send(settingspage.encode('utf8', 'ignore'))
 		self.request.close()
 
@@ -734,7 +859,10 @@ def main():
 	"""Starts the server."""
 	server = ThreadingTCPServer(('', LISTEN_PORT), Handler)
 	_print('[-] Now listening on port', LISTEN_PORT)
-	_print('[-] Date set to', DATE)
+	_print('[-] Default date set to', DATE)
+	_print('[-] Multi-client mode enabled')
+	if shared_state.client_dates:
+		_print('[-] Loaded', len(shared_state.client_dates), 'saved client date(s)')
 	try:
 		server.serve_forever()
 	except KeyboardInterrupt: # Ctrl+C to stop
